@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -23,6 +25,7 @@ import {
   isProtectedItem,
   itemNumbersArg,
   lockedConversationApplyReason,
+  main,
   openClosingPullRequestApplyReason,
   parseGhJson,
   parseGhJsonLines,
@@ -30,6 +33,7 @@ import {
   protectedLabels,
   relatedTitleSearchTerms,
   renderReviewStartStatusComment,
+  renderWorkPlan,
   reviewArtifactDestination,
   reviewAutomationMarkersFromReport,
   reviewActionForDecision,
@@ -173,8 +177,14 @@ const git = {
 
 function reportFrontMatter(overrides = {}) {
   const values = {
+    number: "123",
     repository: "openclaw/openclaw",
     type: "issue",
+    title: JSON.stringify("Sample item"),
+    url: "https://github.com/openclaw/openclaw/issues/123",
+    reviewed_at: "2026-04-30T12:00:00.000Z",
+    main_sha: "abcdef1234567890",
+    pull_head_sha: "unknown",
     decision: "keep_open",
     close_reason: "none",
     confidence: "high",
@@ -186,6 +196,23 @@ ${Object.entries(values)
   .map(([key, value]) => `${key}: ${value}`)
   .join("\n")}
 ---
+`;
+}
+
+function workPlanReport(overrides = {}, prompt = "Fix the queue promotion path.") {
+  return `${reportFrontMatter({
+    work_candidate: "queue_fix_pr",
+    work_status: "candidate",
+    work_confidence: "high",
+    work_priority: "medium",
+    work_cluster_refs: JSON.stringify(["#122", "openclaw/clawhub#9"]),
+    work_validation: JSON.stringify(["pnpm run test:unit", "pnpm run check"]),
+    work_likely_files: JSON.stringify(["src/clawsweeper.ts", "test/clawsweeper.test.mjs"]),
+    ...overrides,
+  })}
+## Repair Work Prompt
+
+${prompt}
 `;
 }
 
@@ -206,6 +233,105 @@ function auditRecord(number, overrides = {}) {
     ...overrides,
   };
 }
+
+test("renderWorkPlan renders a deterministic maintainer coding plan", () => {
+  const markdown = workPlanReport({ number: "456", title: JSON.stringify("Queue fix plan") });
+  const plan = renderWorkPlan(markdown);
+
+  assert.match(plan, /^# Coding Plan: #456 - Queue fix plan/);
+  assert.match(plan, /\[Item record\]\(\.\.\/items\/456\.md\)/);
+  assert.match(plan, /\[GitHub item\]\(https:\/\/github\.com\/openclaw\/openclaw\/issues\/456\)/);
+  assert.match(plan, /Confidence: high \| Priority: medium/);
+  assert.match(plan, /Fix the queue promotion path\./);
+  assert.match(
+    plan,
+    /\[src\/clawsweeper\.ts\]\(https:\/\/github\.com\/openclaw\/openclaw\/blob\/abcdef1234567890\/src\/clawsweeper\.ts\)/,
+  );
+  assert.match(plan, /- \[ \] pnpm run test:unit/);
+  assert.match(plan, /\[#122\]\(https:\/\/github\.com\/openclaw\/openclaw\/issues\/122\)/);
+  assert.match(
+    plan,
+    /pnpm run repair:create-job -- --from-report records\/openclaw-openclaw\/items\/456\.md/,
+  );
+});
+
+test("renderWorkPlan tolerates missing optional work fields", () => {
+  const plan = renderWorkPlan(
+    workPlanReport(
+      {
+        work_cluster_refs: JSON.stringify([]),
+        work_validation: JSON.stringify([]),
+        work_likely_files: JSON.stringify([]),
+        work_priority: "low",
+      },
+      "",
+    ),
+  );
+
+  assert.match(plan, /_No repair prompt provided\._/);
+  assert.match(plan, /- \[ \] _No validation steps provided\._/);
+  assert.match(plan, /- _None recorded\._/);
+});
+
+test("apply-artifacts writes candidate work plans and removes them for closed artifacts", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-plans-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const planPath = join(root, "plans", "789.md");
+    mkdirSync(artifactDir, { recursive: true });
+    writeFileSync(
+      join(artifactDir, "789.md"),
+      workPlanReport({ number: "789", title: JSON.stringify("Generate work plan") }),
+      "utf8",
+    );
+
+    main([
+      "apply-artifacts",
+      "--artifact-dir",
+      artifactDir,
+      "--items-dir",
+      itemsDir,
+      "--closed-dir",
+      closedDir,
+      "--skip-reconcile",
+      "--skip-dashboard",
+      "--replay-closed-artifacts",
+    ]);
+
+    assert.equal(existsSync(planPath), true);
+    assert.match(readFileSync(planPath, "utf8"), /# Coding Plan: #789 - Generate work plan/);
+
+    writeFileSync(
+      join(artifactDir, "789.md"),
+      workPlanReport({
+        number: "789",
+        action_taken: "closed",
+        current_state: "closed",
+      }),
+      "utf8",
+    );
+
+    main([
+      "apply-artifacts",
+      "--artifact-dir",
+      artifactDir,
+      "--items-dir",
+      itemsDir,
+      "--closed-dir",
+      closedDir,
+      "--skip-reconcile",
+      "--skip-dashboard",
+      "--replay-closed-artifacts",
+    ]);
+
+    assert.equal(existsSync(planPath), false);
+    assert.equal(existsSync(join(closedDir, "789.md")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("protected labels are normalized and excluded from normal planning", () => {
   assert.deepEqual(protectedLabels(["Security", "bug", "maintainer", "SECURITY"]), [

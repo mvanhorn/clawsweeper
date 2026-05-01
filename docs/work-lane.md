@@ -14,6 +14,11 @@ Reports store the lane fields in frontmatter:
 The dashboard shows fresh `queue_fix_pr` reports whose `work_status` is
 `candidate`. This is a manual promotion queue for the repair lane.
 
+Candidate reports also render a maintainer-readable coding plan under the
+repository's `records/<repo-slug>/plans/` directory. These plans are generated
+from the existing work-lane fields and link back to the source report, target
+item, likely files, validation steps, and related cluster references.
+
 Promote a candidate from this checkout:
 
 ```bash

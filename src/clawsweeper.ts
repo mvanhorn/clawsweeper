@@ -297,6 +297,15 @@ interface DashboardItem {
   workStatus: string;
 }
 
+interface DashboardWorkPlan {
+  repo: string;
+  number: number;
+  planPath: string;
+  priority: string;
+  reviewedAt: string | undefined;
+  mtimeMs: number;
+}
+
 interface DashboardClosedItem {
   repo: string;
   number: number;
@@ -381,11 +390,13 @@ interface DashboardStats {
   failed: number;
   stale: number;
   workCandidates: number;
+  workPlans: number;
   byKind: Record<ItemKind, DashboardKindStats>;
   cadence: DashboardCadenceStats;
   activity: DashboardActivityStats;
   recent: DashboardItem[];
   workQueue: DashboardItem[];
+  recentWorkPlans: DashboardWorkPlan[];
   recentClosed: DashboardClosedItem[];
 }
 
@@ -703,6 +714,10 @@ function repoRecordsDir(profile = targetProfile()): string {
 
 function defaultItemsDir(profile = targetProfile()): string {
   return join(repoRecordsDir(profile), "items");
+}
+
+function defaultPlansDir(profile = targetProfile()): string {
+  return join(repoRecordsDir(profile), "plans");
 }
 
 function defaultClosedDir(profile = targetProfile()): string {
@@ -4592,6 +4607,139 @@ function markdownList(values: string[]): string {
   return values.length ? values.map((value) => `- ${value}`).join("\n") : "- none";
 }
 
+function plansDirForItemsDir(itemsDir: string): string {
+  return join(dirname(itemsDir), "plans");
+}
+
+function usableSha(value: string | undefined): string | undefined {
+  if (!value || value === "unknown" || value === "none") return undefined;
+  return value;
+}
+
+function workPlanFileLink(repo: string, file: string, sha: string): string {
+  const parsed = splitFileAndLine(file);
+  const label = parsed.line ? `${parsed.file}:${parsed.line}` : parsed.file;
+  return markdownLink(
+    label,
+    repoUrlFor(
+      repo,
+      `/blob/${sha}/${githubPath(parsed.file)}${parsed.line ? `#L${parsed.line}` : ""}`,
+    ),
+  );
+}
+
+function workPlanClusterLink(repo: string, ref: string): string {
+  const trimmed = ref.trim();
+  if (/^https?:\/\//.test(trimmed)) return markdownLink(trimmed, trimmed);
+  const repoItem = trimmed.match(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)$/);
+  if (repoItem?.[1] && repoItem[2]) {
+    return markdownLink(trimmed, itemUrlFor(repoItem[1], Number(repoItem[2])));
+  }
+  const localItem = trimmed.match(/^#(\d+)$/);
+  if (localItem?.[1]) return markdownLink(trimmed, itemUrlFor(repo, Number(localItem[1])));
+  return trimmed;
+}
+
+function checklist(values: readonly string[]): string {
+  return values.length
+    ? values.map((value) => `- [ ] ${value}`).join("\n")
+    : "- [ ] _No validation steps provided._";
+}
+
+function linkedList(values: readonly string[], linkValue: (value: string) => string): string {
+  return values.length
+    ? values.map((value) => `- ${linkValue(value)}`).join("\n")
+    : "- _None recorded._";
+}
+
+function shouldRenderWorkPlan(markdown: string): boolean {
+  return (
+    frontMatterValue(markdown, "work_candidate") === "queue_fix_pr" &&
+    frontMatterValue(markdown, "work_status") === "candidate"
+  );
+}
+
+function syncWorkPlanFile(options: {
+  markdown: string;
+  file: string;
+  destinationDir: string;
+  itemsDir: string;
+  dryRun?: boolean;
+}): void {
+  const plansDir = plansDirForItemsDir(options.itemsDir);
+  const planPath = join(plansDir, options.file);
+  if (options.destinationDir !== options.itemsDir || !shouldRenderWorkPlan(options.markdown)) {
+    if (existsSync(planPath) && !options.dryRun) unlinkSync(planPath);
+    return;
+  }
+  if (options.dryRun) return;
+  ensureDir(plansDir);
+  writeFileSync(
+    planPath,
+    renderWorkPlan(options.markdown, { reportPath: `../items/${options.file}` }),
+    "utf8",
+  );
+}
+
+export function renderWorkPlan(
+  markdown: string,
+  options: { reportPath?: string; profile?: RepositoryProfile } = {},
+): string {
+  const repo = markdownRepository(markdown);
+  const profile = options.profile ?? repositoryProfileFor(repo);
+  const number = Number(frontMatterValue(markdown, "number") ?? 0);
+  const title = frontMatterValue(markdown, "title") ?? "Untitled item";
+  const kind = (frontMatterValue(markdown, "type") as ItemKind | undefined) ?? "issue";
+  const reviewedSha =
+    usableSha(frontMatterValue(markdown, "main_sha")) ??
+    usableSha(frontMatterValue(markdown, "pull_head_sha")) ??
+    "main";
+  const workPrompt =
+    reviewSectionValue(markdown, "repairWorkPrompt") ||
+    frontMatterValue(markdown, "work_prompt") ||
+    "_No repair prompt provided._";
+  const likelyFiles = frontMatterStringArray(markdown, "work_likely_files");
+  const validation = frontMatterStringArray(markdown, "work_validation");
+  const clusterRefs = frontMatterStringArray(markdown, "work_cluster_refs");
+  const pullHeadSha = usableSha(frontMatterValue(markdown, "pull_head_sha")) ?? "n/a";
+  const reportPath = options.reportPath ?? `../items/${number}.md`;
+
+  return `# Coding Plan: #${number} - ${title}
+
+${markdownLink("Item record", reportPath)} | ${markdownLink("GitHub item", itemUrlFor(repo, number, kind))}
+
+Confidence: ${frontMatterValue(markdown, "work_confidence") ?? "low"} | Priority: ${frontMatterValue(markdown, "work_priority") ?? "low"}
+
+## What needs to change
+
+${workPrompt}
+
+## Likely files
+
+${linkedList(likelyFiles, (file) => workPlanFileLink(repo, file, reviewedSha))}
+
+## Validation
+
+${checklist(validation)}
+
+## Cluster references
+
+${linkedList(clusterRefs, (ref) => workPlanClusterLink(repo, ref))}
+
+## Source review
+
+- Decision: ${frontMatterValue(markdown, "decision") ?? "unknown"} | Confidence: ${frontMatterValue(markdown, "confidence") ?? "unknown"}
+- Reviewed at: ${frontMatterValue(markdown, "reviewed_at") ?? "unknown"}
+- Pull head sha: ${pullHeadSha}
+
+---
+Generated by ClawSweeper. Promote with:
+\`\`\`bash
+pnpm run repair:create-job -- --from-report records/${profile.slug}/items/${number}.md
+\`\`\`
+`;
+}
+
 function renderWorkCandidateReportSection(decision: Decision): string {
   const lines = [
     `Candidate: ${decision.workCandidate}`,
@@ -5517,6 +5665,7 @@ function applyArtifactsCommand(args: Args): void {
       const stalePath = join(destinationDir === itemsDir ? closedDir : itemsDir, destinationFile);
       if (existsSync(stalePath)) unlinkSync(stalePath);
       writeFileSync(join(destinationDir, destinationFile), markdown, "utf8");
+      syncWorkPlanFile({ markdown, file: destinationFile, destinationDir, itemsDir });
       appliedArtifacts += 1;
     }
   }
@@ -5970,6 +6119,13 @@ function reconcileFolders(options: {
     }
     const markdown = markReconciledState(sourceMarkdown, "closed", { closedAt });
     moveMarkdownFile({ sourcePath, destinationPath, markdown, dryRun });
+    syncWorkPlanFile({
+      markdown,
+      file,
+      destinationDir: options.closedDir,
+      itemsDir: options.itemsDir,
+      dryRun,
+    });
     movedToClosed += 1;
   }
 
@@ -6062,9 +6218,11 @@ function dashboardStats(
   itemsDir: string,
   closedDir = defaultClosedDir(),
   profile = targetProfile(),
+  plansDir = defaultPlansDir(profile),
 ): DashboardStats {
   const files = markdownFiles(itemsDir);
   const closedFiles = markdownFiles(closedDir);
+  const planFiles = markdownFiles(plansDir);
   const now = Date.now();
   let fresh = 0;
   let proposedClose = 0;
@@ -6072,6 +6230,7 @@ function dashboardStats(
   let failed = 0;
   let stale = 0;
   let workCandidates = 0;
+  const recentWorkPlans: DashboardWorkPlan[] = [];
   const byKind: Record<ItemKind, DashboardKindStats> = {
     issue: emptyDashboardKindStats(),
     pull_request: emptyDashboardKindStats(),
@@ -6167,11 +6326,34 @@ function dashboardStats(
     }
     recordDashboardActivity(markdown, activity, now);
   }
+  for (const file of planFiles) {
+    const planPath = join(plansDir, file);
+    const reportPath = join(itemsDir, file);
+    const reportMarkdown = existsSync(reportPath) ? readFileSync(reportPath, "utf8") : "";
+    const repo = reportMarkdown
+      ? markdownRepository(reportMarkdown, reportPath)
+      : profile.targetRepo;
+    if (repo !== profile.targetRepo) continue;
+    recentWorkPlans.push({
+      repo,
+      number: numberForMarkdownFile(file),
+      planPath: repoRelativePath(planPath),
+      priority: frontMatterValue(reportMarkdown, "work_priority") ?? "unknown",
+      reviewedAt: frontMatterValue(reportMarkdown, "reviewed_at"),
+      mtimeMs: statSync(planPath).mtimeMs,
+    });
+  }
   recent.sort((a, b) => Date.parse(b.reviewedAt ?? "") - Date.parse(a.reviewedAt ?? ""));
   workQueue.sort(
     (a, b) =>
       workPriorityScore(b.workPriority) - workPriorityScore(a.workPriority) ||
       Date.parse(b.reviewedAt ?? "") - Date.parse(a.reviewedAt ?? ""),
+  );
+  recentWorkPlans.sort(
+    (a, b) =>
+      b.mtimeMs - a.mtimeMs ||
+      Date.parse(b.reviewedAt ?? "") - Date.parse(a.reviewedAt ?? "") ||
+      b.number - a.number,
   );
   recentClosed.sort(
     (a, b) =>
@@ -6219,6 +6401,7 @@ function dashboardStats(
     failed,
     stale,
     workCandidates,
+    workPlans: recentWorkPlans.length,
     byKind,
     cadence: {
       hourlyHotItems,
@@ -6234,6 +6417,7 @@ function dashboardStats(
     activity,
     recent,
     workQueue,
+    recentWorkPlans,
     recentClosed,
   };
 }
@@ -6349,6 +6533,18 @@ function formatWorkQueueRows(items: readonly DashboardItem[], limit = 10): strin
   );
 }
 
+function formatWorkPlanRows(items: readonly DashboardWorkPlan[], limit = 10): string {
+  return (
+    items
+      .slice(0, limit)
+      .map((item) => {
+        const plan = markdownLink(`#${item.number}`, reportFileUrl(item.number, item.planPath));
+        return `| ${plan} | ${markdownLink(item.repo, repoUrlFor(item.repo))} | ${item.priority} | ${formatTimestamp(item.reviewedAt)} |`;
+      })
+      .join("\n") || "| _None_ |  |  |  |"
+  );
+}
+
 function formatFleetRecentClosedRows(items: readonly DashboardClosedItem[], limit = 10): string {
   return (
     items
@@ -6429,13 +6625,16 @@ function aggregateActivity(snapshots: readonly RepoDashboardSnapshot[]): Dashboa
 function buildRepoDashboardSnapshot(
   profile: RepositoryProfile,
   readme: string,
-  options: { itemsDir?: string; closedDir?: string } = {},
+  options: { itemsDir?: string; closedDir?: string; plansDir?: string } = {},
 ): RepoDashboardSnapshot {
+  const itemsDir = options.itemsDir ?? defaultItemsDir(profile);
   const stats = withTargetProfile(profile, () =>
     dashboardStats(
-      options.itemsDir ?? defaultItemsDir(profile),
+      itemsDir,
       options.closedDir ?? defaultClosedDir(profile),
       profile,
+      options.plansDir ??
+        (options.itemsDir ? plansDirForItemsDir(itemsDir) : defaultPlansDir(profile)),
     ),
   );
   const status = currentWorkflowStatusBlock(readme, profile);
@@ -6462,7 +6661,7 @@ function dashboardSnapshots(
 
 function formatRepositoryOverviewRow(snapshot: RepoDashboardSnapshot): string {
   const stats = snapshot.stats;
-  return `| ${markdownLink(snapshot.profile.displayName, repoUrlFor(snapshot.profile.targetRepo))} | ${stats.open.total} | ${stats.files} | ${stats.cadence.unreviewedOpen} | ${stats.cadence.due} | ${stats.proposedClose} | ${stats.workCandidates} | ${stats.closed} | ${formatTimestamp(stats.activity.latestReviewAt)} | ${formatTimestamp(stats.activity.latestCloseAt)} | ${stats.activity.lastHour.commentSyncs} |`;
+  return `| ${markdownLink(snapshot.profile.displayName, repoUrlFor(snapshot.profile.targetRepo))} | ${stats.open.total} | ${stats.files} | ${stats.cadence.unreviewedOpen} | ${stats.cadence.due} | ${stats.proposedClose} | ${stats.workCandidates} | ${stats.workPlans} | ${stats.closed} | ${formatTimestamp(stats.activity.latestReviewAt)} | ${formatTimestamp(stats.activity.latestCloseAt)} | ${stats.activity.lastHour.commentSyncs} |`;
 }
 
 function formatWorkflowStatusRow(snapshot: RepoDashboardSnapshot): string {
@@ -6506,6 +6705,7 @@ ${snapshot.status}
 | Fresh verified reviews in the last ${FRESH_DAYS} days | ${stats.fresh} |
 | Proposed closes awaiting apply | ${stats.proposedClose} (${formatPercent(stats.proposedClose, stats.fresh)} of fresh reviews) |
 | Work candidates awaiting promotion | ${stats.workCandidates} |
+| Work plans | ${stats.workPlans} |
 | Closed by Codex apply | ${stats.closed} |
 | Failed or stale reviews | ${stats.failed + stats.stale} |
 
@@ -6545,6 +6745,12 @@ ${formatRecentClosedRows(stats.recentClosed)}
 | --- | --- | --- | --- | --- | --- |
 ${formatWorkQueueRows(stats.workQueue)}
 
+#### Recent Work Plans
+
+| Plan | Repo | Priority | Reviewed |
+| --- | --- | --- | --- |
+${formatWorkPlanRows(stats.recentWorkPlans)}
+
 #### Recently Reviewed
 
 | Item | Title | Outcome | Status | Reviewed |
@@ -6569,6 +6775,14 @@ function updateDashboard(itemsDir = defaultItemsDir(), closedDir = defaultClosed
         workPriorityScore(b.workPriority) - workPriorityScore(a.workPriority) ||
         Date.parse(b.reviewedAt ?? "") - Date.parse(a.reviewedAt ?? ""),
     );
+  const workPlans = snapshots
+    .flatMap((snapshot) => snapshot.stats.recentWorkPlans)
+    .sort(
+      (a, b) =>
+        b.mtimeMs - a.mtimeMs ||
+        Date.parse(b.reviewedAt ?? "") - Date.parse(a.reviewedAt ?? "") ||
+        b.number - a.number,
+    );
   const recentClosed = snapshots
     .flatMap((snapshot) => snapshot.stats.recentClosed)
     .sort(
@@ -6587,6 +6801,7 @@ function updateDashboard(itemsDir = defaultItemsDir(), closedDir = defaultClosed
       accumulator.due += stats.cadence.due;
       accumulator.proposedClose += stats.proposedClose;
       accumulator.workCandidates += stats.workCandidates;
+      accumulator.workPlans += stats.workPlans;
       accumulator.closed += stats.closed;
       accumulator.failedOrStale += stats.failed + stats.stale;
       accumulator.archivedFiles += stats.archivedFiles;
@@ -6600,6 +6815,7 @@ function updateDashboard(itemsDir = defaultItemsDir(), closedDir = defaultClosed
       due: 0,
       proposedClose: 0,
       workCandidates: 0,
+      workPlans: 0,
       closed: 0,
       failedOrStale: 0,
       archivedFiles: 0,
@@ -6622,14 +6838,15 @@ Last dashboard update: ${formatTimestamp(new Date().toISOString())}
 | Due now by cadence | ${totals.due} |
 | Proposed closes awaiting apply | ${totals.proposedClose} |
 | Work candidates awaiting promotion | ${totals.workCandidates} |
+| Work plans | ${totals.workPlans} |
 | Closed by Codex apply | ${totals.closed} |
 | Failed or stale reviews | ${totals.failedOrStale} |
 | Archived closed files | ${totals.archivedFiles} |
 
 ### Repositories
 
-| Repository | Open | Reviewed | Unreviewed | Due | Proposed closes | Work candidates | Closed | Latest review | Latest close | Comments synced, 1h |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |
+| Repository | Open | Reviewed | Unreviewed | Due | Proposed closes | Work candidates | Work plans | Closed | Latest review | Latest close | Comments synced, 1h |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |
 ${snapshots.map(formatRepositoryOverviewRow).join("\n")}
 
 ### Current Runs
@@ -6659,6 +6876,12 @@ ${formatFleetRecentClosedRows(recentClosed)}
 | Repository | Item | Title | Priority | Status | Reviewed | Report |
 | --- | --- | --- | --- | --- | --- | --- |
 ${formatFleetWorkQueueRows(workQueue)}
+
+### Recent Work Plans
+
+| Plan | Repo | Priority | Reviewed |
+| --- | --- | --- | --- |
+${formatWorkPlanRows(workPlans)}
 
 <details>
 <summary>Recently Reviewed Across Repos</summary>

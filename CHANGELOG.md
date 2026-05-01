@@ -16,6 +16,7 @@ checkpoint, and status-only commits are intentionally omitted.
 - Added targeted single-item review support.
 - Added README dashboard links to generated item reports, fixed evidence, issue
   and PR close-rate metrics, cadence coverage, workflow status, and apply status.
+- Added rendered coding plan markdown for `queue_fix_pr` work candidates.
 - Added archived `closed/` records so `items/` can stay focused on open tracked
   items.
 - Added a read-only audit command for checking live GitHub state against
