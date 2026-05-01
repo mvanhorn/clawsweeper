@@ -5300,6 +5300,13 @@ function applyDecisionsCommand(args: Args): void {
       ensureDir(closedDir);
       writeFileSync(path, nextMarkdown, "utf8");
       renameSync(path, join(closedDir, file));
+      syncWorkPlanFile({
+        markdown: nextMarkdown,
+        file,
+        destinationDir: closedDir,
+        itemsDir,
+        dryRun,
+      });
     };
     const markApplySkipped = (actionTaken: ActionTaken, reason: string): boolean => {
       markdown = replaceFrontMatterValue(markdown, "action_taken", actionTaken);
